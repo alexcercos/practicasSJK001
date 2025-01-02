@@ -2,12 +2,88 @@ import GUI
 import HAL
 import cv2
 import utm
+import math
 
 import numpy as np
 
 face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
+
+faces_detected = []
+potential_locations = []
+debug_colors = [(0, 0, 255),(0, 255, 255),(0, 255, 0), (200, 200, 50),(200, 50, 200),(50, 200, 200),(50, 50, 200),(200, 50, 50),(50, 200, 50),(200, 200, 200),(0,0,50)]
+
+# Hay muchos ajustes a mano, especialmente en temas de coordenadas de pixeles en imagen y coordenadas reales (no esta claro como obtener cierta informacion)
+
+def update_potential_location(lx, ly, weight, pixel_count):
+
+    #iterate previous locations
+    for i,location in enumerate(potential_locations):
+        cx,cy = location[0]
+        d = ((cx-lx)**2 + (cy-ly)**2)**0.5
+
+        if d<2.5: #update location
+            location[3] = max(pixel_count, location[3]) #normalization
+            if location[3]>0:
+                weight *= (pixel_count / location[3])
+            cx = cx * (1.0-weight) + lx*weight
+            cy = cy * (1.0-weight) + ly*weight
+            location[0] = (cx,cy)
+            location[2] = max(weight,location[2]) #track max weight
+            
+            if location[1]:
+                return (255,0,0) #blue for visited
+            return debug_colors[min(i,len(debug_colors))]
+    
+    # append new (unchecked) location
+    potential_locations.append([(lx,ly), False, weight, 0])
+    return debug_colors[min(len(potential_locations),len(debug_colors))-1]
+
+def get_next_location():
+    track_loc = (0,0)
+    for location in potential_locations:
+        if not location[1]:
+            if location[2]>0.01:
+                location[1] = True #mark as seen
+                return location[0]
+
+            # track, but not mark (if only seen in image bounds)
+            track_loc = location[0] 
+    
+    return track_loc #Go to base
+
+def relative_position_pixel(pixel_x, pixel_y, drone_height, img_width, img_height):
+    # Constants
+    fov_horizontal = 30  # Degrees
+    #drone_height = 10  # Example height in meters
+    #img_width = 640  # Image width in pixels
+    #img_height = 480  # Image height in pixels
+
+    # Point in the image (x, y) (example point)
+    #pixel_x = 320  # X-coordinate in the image (center of the image)
+    #pixel_y = 240  # Y-coordinate in the image (center of the image)
+
+    # Calculate angular resolution per pixel
+    angle_per_pixel_horizontal = fov_horizontal / img_width
+
+    # Calculate pixel offset from the image center
+    x_offset = pixel_x - (img_width / 2)
+    y_offset = pixel_y - (img_height / 2)
+
+    # Calculate angular offsets
+    theta_x = math.radians(x_offset * angle_per_pixel_horizontal)
+    theta_y = math.radians(y_offset * angle_per_pixel_horizontal)
+
+    # Calculate real-world distances relative to the drone
+    # -> coordinates fix: in image they are oriented to be
+    # +real x = -img y
+    # -real y = +img x
+    real_y = - drone_height * math.tan(theta_x) * 2
+    real_x = - drone_height * math.tan(theta_y) * 2
+
+    return real_x, real_y
+    # print(f"Real-world position relative to the drone: X={real_x:.2f}, Y={real_y:.2f}")
 
 def rotateImage(image, angle, center=None, scale=1.0):
     (h, w) = image.shape[:2]
@@ -21,7 +97,6 @@ def rotateImage(image, angle, center=None, scale=1.0):
 
     return rotated
 
-
 def goToLocation(pos_x, pos_y, height):
     """
     Moves the drone to a specific location (pos_x, pos_y, height).
@@ -29,6 +104,8 @@ def goToLocation(pos_x, pos_y, height):
     Images are displayed while moving, and progress information is printed.
     """
     tolerance = 0.5  # Acceptable distance in meters to consider the drone at the target
+
+    print(f"Going to: x={pos_x:.2f}, y={pos_y:.2f}, z={height:.2f}")
 
     while True:
 
@@ -43,8 +120,7 @@ def goToLocation(pos_x, pos_y, height):
 
         # Check if the drone is within tolerance of the target position
         if abs(error_x) < tolerance and abs(error_y) < tolerance and abs(error_z) < tolerance:
-            print("Target reached successfully!")
-            print(f"Final position: x={drone_x:.2f}, y={drone_y:.2f}, z={drone_z:.2f}")
+            print(f"Target reached successfully!: x={drone_x:.2f}, y={drone_y:.2f}, z={drone_z:.2f}")
             break
 
         # Command the drone to move towards the target
@@ -53,79 +129,73 @@ def goToLocation(pos_x, pos_y, height):
         # Display the images during movement
         frontal_img = HAL.get_frontal_image()
         ventral_img = HAL.get_ventral_image()
-        GUI.showImage(frontal_img)
+        #GUI.showImage(frontal_img)
         GUI.showLeftImage(ventral_img)
 
         # Print progress information
-        print(f"Current position: x={drone_x:.2f}, y={drone_y:.2f}, z={drone_z:.2f}")
+        #print(f"Current position: x={drone_x:.2f}, y={drone_y:.2f}, z={drone_z:.2f}")
 
-def centerOnBlackRegion():
-    """
-    Detects black regions in the ventral image, differentiates them, and centers
-    the drone's camera on one of them (largest region).
-    """
+def detectBlackRegions():
+
     black_threshold = 50  # Threshold to define black regions (intensity <= 50)
-    movement_step = 0.5   # Step size for drone adjustments
-    tolerance = 20        # Tolerance in pixels for centering
 
-    while True:
+    # Capture the ventral image
+    ventral_img = HAL.get_ventral_image()
+    GUI.showLeftImage(ventral_img)
+    gray = cv2.cvtColor(ventral_img, cv2.COLOR_BGR2GRAY)
 
-        # Capture the ventral image
-        ventral_img = HAL.get_ventral_image()
-        gray = cv2.cvtColor(ventral_img, cv2.COLOR_BGR2GRAY)
+    # Threshold the image to detect black regions
+    _, threshold_img = cv2.threshold(gray, black_threshold, 255, cv2.THRESH_BINARY_INV)
 
-        # Threshold the image to detect black regions
-        _, threshold_img = cv2.threshold(gray, black_threshold, 255, cv2.THRESH_BINARY_INV)
+    # Find contours of the black regions
+    contours, _ = cv2.findContours(threshold_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Find contours of the black regions
-        contours, _ = cv2.findContours(threshold_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        print("No black regions detected.")
+        GUI.showImage(ventral_img)
+        return
 
-        if not contours:
-            print("No black regions detected.")
-            GUI.showLeftImage(ventral_img)
-            return
+    img_height, img_width = ventral_img.shape[:2]
 
-        # Find the largest contour (assuming it's the target region)
-        largest_contour = max(contours, key=cv2.contourArea)
-        M = cv2.moments(largest_contour)
+    detected_contours = []
 
-        if M["m00"] == 0:  # Avoid division by zero
-            print("Unable to calculate center of the black region.")
-            return
+    drone_coord = HAL.get_position()
 
-        # Calculate the center of the black region
-        cX = int(M["m10"] / M["m00"])
-        cY = int(M["m01"] / M["m00"])
+    for contour in contours:
 
-        # Draw contours and center for visualization
-        cv2.drawContours(ventral_img, [largest_contour], -1, (0, 255, 0), 2)
-        cv2.circle(ventral_img, (cX, cY), 5, (255, 0, 0), -1)
+        if len(contour) < 20: #Remove small regions
+            continue
+        
+        boundary_touched = False  # Flag for boundary-touching regions
 
-        # Get image dimensions and calculate offsets from center
-        img_center_x = ventral_img.shape[1] // 2
-        img_center_y = ventral_img.shape[0] // 2
-        offset_x = cX - img_center_x
-        offset_y = cY - img_center_y
+        # Check if the region touches the boundary
+        for point in contour:
+            x, y = point[0]
+            if x == 0 or y == 0 or x == img_width - 1 or y == img_height - 1:
+                boundary_touched = True
+                break
 
-        print(f"Offset: X={offset_x}, Y={offset_y}")
+        # Calculate the center of the region
+        M = cv2.moments(contour)
+        zclr = (0,0,0)
+        if M["m00"] != 0:  # Avoid division by zero
+            cX = int(M["m10"] / M["m00"])
+            cY = int(M["m01"] / M["m00"])
+            # Draw a blue circle at the center of the region
 
-        # Centering logic: Move the drone to center the black region
-        if abs(offset_x) < tolerance and abs(offset_y) < tolerance:
-            print("Black region centered.")
-            GUI.showLeftImage(ventral_img)
-            return
+            rx,ry = relative_position_pixel(cX, cY, drone_coord[2], ventral_img.shape[1], ventral_img.shape[0])
 
-        # Adjust the drone's position based on offsets
-        move_x = -movement_step if offset_x > tolerance else (movement_step if offset_x < -tolerance else 0)
-        move_y = -movement_step if offset_y > tolerance else (movement_step if offset_y < -tolerance else 0)
+            zclr = update_potential_location(drone_coord[0]+rx,drone_coord[1]+ry, 0.0 if boundary_touched else 0.2, len(contour))
 
-        drone_coord = HAL.get_position()
-        HAL.set_cmd_pos(drone_coord[0] + move_x, drone_coord[1] + move_y, drone_coord[2], 0)
+        cv2.drawContours(ventral_img, [contour], -1, zclr, -1)
 
-        # Show the updated image
-        GUI.showLeftImage(ventral_img)
+    print("; ".join([f"({l[0][0]:.2f}, {l[0][1]:.2f} -> {l[1]})" for l in potential_locations]))
 
-def detectFaces():
+    # Show the updated image
+    GUI.showImage(ventral_img)
+
+
+def detectFaces(): #TODO simplify (avoid centering, use relative pixel coords)
     """
     Detects faces by rotating the ventral image in 30-degree increments.
     If a face is found, it centers the drone on the face, lowers the altitude by 1 meter,
@@ -178,7 +248,7 @@ def detectFaces():
             for x, y, w, h in faces:
                 # Visualize the detected face
                 cv2.rectangle(ventral_img, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                GUI.showLeftImage(ventral_img)
+                GUI.showImage(ventral_img)
 
                 # Center on the face
                 centerFace(x, y, w, h, ventral_img)
@@ -206,69 +276,6 @@ def detectFaces():
     return []
 
 
-def spiralSearch(start_x, start_y, height, step_size=3, max_loops=10):
-    """
-    Perform a spiral search starting from a given location.
-    
-    Parameters:
-    - start_x, start_y, height: Starting coordinates for the search.
-    - step_size: Distance (in meters) for each movement step.
-    - max_loops: Maximum number of loops for the spiral.
-    """
-    # Move to the starting location
-    print(f"Going to start location: ({start_x}, {start_y}, {height})")
-    goToLocation(start_x, start_y, height)
-    
-    # Initialize spiral parameters
-    current_x, current_y = start_x, start_y
-    directions = [(1, 0), (0, 1), (-1, 0), (0, -1)]  # [right, up, left, down]
-    loop = 0
-    direction_index = 0  # Start with the first direction (right)
-
-    # Start the spiral search
-    while loop < max_loops:
-        # Check for black regions and center on one if found
-        print("Checking for black regions...")
-        centerOnBlackRegion()
-        
-        # If a black region is detected, call a placeholder function
-        # Placeholder: replace this with your own logic
-        print("Detected a black region. Processing...")
-        detectFaces()  # Uncomment and implement this function
-        
-        # Move in the current direction
-        for _ in range(2):  # Perform two moves in each direction before turning
-            if loop >= max_loops:
-                break
-
-            # Calculate the next position
-            dx, dy = directions[direction_index]
-            next_x = current_x + dx * step_size
-            next_y = current_y + dy * step_size
-            
-            # Move to the next position
-            print(f"Moving to ({next_x}, {next_y}, {height})")
-            goToLocation(next_x, next_y, height)
-            
-            # Update the current position
-            current_x, current_y = next_x, next_y
-
-        # Change direction (right -> up -> left -> down -> repeat)
-        direction_index = (direction_index + 1) % 4
-
-        # Increase loop count and expand the spiral radius
-        loop += 1
-        step_size += 1  # Expand the spiral
-
-    print("Spiral search completed.")
-
-
-
-# TODO find faces : rotate img in 30 increments
-# avoid calling when there is only water
-
-# TODO find others : fly higher, detect points ?? go towards them?
-
 # Enter sequential code!
 
 boat_lat = 40 + 16 / 60 + 48.2 / 3600
@@ -280,46 +287,53 @@ survivors_lon = -3 + 49 / 60 + 1.78 / 3600
 boat_coord = utm.from_latlon(boat_lat, boat_lon)
 surv_coord = utm.from_latlon(survivors_lat, survivors_lon)
 
-diff_x = -(surv_coord[0] - boat_coord[0])
-diff_y = surv_coord[1] - boat_coord[1]  # el sucio ajuste
+diff_x = -(surv_coord[0] - boat_coord[0]) # el sucio ajuste
+diff_y = surv_coord[1] - boat_coord[1]
+
+
+if HAL.get_landed_state() == 3:
+    print("RESET THE IMAGE")
+    # If this happens, errors occur (should not be in the air yet)
 
 HAL.takeoff(3)
+print("Takeoff finished")
 
-# TODO remove
-diff_x = 38
-diff_y = -31
 
-# spiralSearch(diff_x, diff_y, 3)
-# goToLocation(diff_x, diff_y, 3)
-# centerOnBlackRegion()
+# TODO go to initial location
+#go to 20m height
+#detect black regions, center on closest unseen (estimate position)
+#lower to 3m, detect faces (check all rotations)
+#if detected, add to list
+#go to 20m height, repeat
+
+# potential locations: exp average (if red more weight), with 1m radius tolerance, checked bool?
+# verified locations: detected face (calculate coords once)
+target_x=diff_x
+target_y=diff_y
+
+# go to first location
+goToLocation(target_x, target_y, 3)
+goToLocation(target_x, target_y, 20)
+
+for i in range(50):
+    detectBlackRegions()
 
 while True:
+    
+    target_x,target_y = get_next_location()
+    goToLocation(target_x, target_y, 3)
+    
+    
+    if target_x==0 and target_y==0:
+        HAL.land()
+        break #finished (returned to base)
+    else:
+        for i in range(5): #TODO remove
+            detectBlackRegions()
+        #TODO detect faces
 
-    drone_coord = HAL.get_position()
+    goToLocation(target_x, target_y, 20)
+    for i in range(50):
+        detectBlackRegions()
 
-    frontal_img = HAL.get_frontal_image()
-    ventral_img = rotateImage(HAL.get_ventral_image(), -30)
-
-    # Convert the image to grayscale
-    gray = cv2.cvtColor(ventral_img, cv2.COLOR_BGR2GRAY)
-
-    # Perform face detection
-    faces = face_cascade.detectMultiScale(
-        gray, scaleFactor=1.1, minNeighbors=4, minSize=(20, 20)
-    )
-
-    # Draw rectangles around the detected faces
-    for x, y, w, h in faces:
-        cv2.rectangle(ventral_img, (x, y), (x + w, y + h), (255, 0, 0), 2)
-
-    GUI.showImage(frontal_img)
-    GUI.showLeftImage(ventral_img)
-
-    faces = face_cascade.detectMultiScale(
-        ventral_img, scaleFactor=1.1, minNeighbors=4, minSize=(20, 20)
-    )
-
-    HAL.set_cmd_pos(diff_x, diff_y, 3, 0)
-
-    print(diff_x, diff_y, drone_coord)
-    print(faces)
+print("Faces detected: ",faces_detected)
