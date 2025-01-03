@@ -14,7 +14,8 @@ faces_detected = []
 potential_locations = []
 debug_colors = [(0, 0, 255),(0, 255, 255),(0, 255, 0), (200, 200, 50),(200, 50, 200),(50, 200, 200),(50, 50, 200),(200, 50, 50),(50, 200, 50),(200, 200, 200),(0,0,50)]
 
-# Hay muchos ajustes a mano, especialmente en temas de coordenadas de pixeles en imagen y coordenadas reales (no esta claro como obtener cierta informacion)
+# Hay muchos ajustes a mano, especialmente en temas de coordenadas de pixeles 
+# en imagen y coordenadas reales (no esta claro como obtener cierta informacion)
 
 def update_potential_location(lx, ly, weight, pixel_count):
 
@@ -23,14 +24,14 @@ def update_potential_location(lx, ly, weight, pixel_count):
         cx,cy = location[0]
         d = ((cx-lx)**2 + (cy-ly)**2)**0.5
 
-        if d<2.5: #update location
+        if d<2.2: #update location
             location[3] = max(pixel_count, location[3]) #normalization
             if location[3]>0:
                 weight *= (pixel_count / location[3])
             cx = cx * (1.0-weight) + lx*weight
             cy = cy * (1.0-weight) + ly*weight
             location[0] = (cx,cy)
-            location[2] = max(weight,location[2]) #track max weight
+            location[2] = (weight*0.2+location[2]*0.8) #to favour more centered regions when choosing target
             
             if location[1]:
                 return (255,0,0) #blue for visited
@@ -41,17 +42,21 @@ def update_potential_location(lx, ly, weight, pixel_count):
     return debug_colors[min(len(potential_locations),len(debug_colors))-1]
 
 def get_next_location():
-    track_loc = (0,0)
+    track_loc = None
+    best_weight = 0
     for location in potential_locations:
-        if not location[1]:
-            if location[2]>0.01:
-                location[1] = True #mark as seen
-                return location[0]
-
-            # track, but not mark (if only seen in image bounds)
-            track_loc = location[0] 
+        if location[1]:
+            continue
+        
+        if location[2]>best_weight:
+            best_weight = location[2]
+            track_loc = location
     
-    return track_loc #Go to base
+    if track_loc is None:
+        return (0,0)
+
+    track_loc[1] = True #mark as seen
+    return track_loc[0]
 
 def relative_position_pixel(pixel_x, pixel_y, drone_height, img_width, img_height):
     # Constants
@@ -91,11 +96,35 @@ def rotateImage(image, angle, center=None, scale=1.0):
     if center is None:
         center = (w / 2, h / 2)
 
-    # Perform the rotation
+    # Calculate the rotation matrix
     M = cv2.getRotationMatrix2D(center, angle, scale)
-    rotated = cv2.warpAffine(image, M, (w, h))
+    
+    # Calculate the cosine and sine of the angle to determine the new bounding dimensions
+    abs_cos = abs(M[0, 0])
+    abs_sin = abs(M[0, 1])
+    
+    # Compute new width and height of the rotated image
+    new_w = int(h * abs_sin + w * abs_cos)
+    new_h = int(h * abs_cos + w * abs_sin)
+    
+    # Adjust the rotation matrix to account for the translation
+    M[0, 2] += (new_w / 2) - center[0]
+    M[1, 2] += (new_h / 2) - center[1]
 
-    return rotated
+    # cyan
+    most_common_color = (255, 150, 0)
+
+    # Create a canvas with the most common color
+    canvas = np.full((new_h, new_w, 3), most_common_color, dtype=np.uint8)
+    
+    # Perform the rotation with the new dimensions
+    rotated = cv2.warpAffine(image, M, (new_w, new_h))
+    
+    # Overlay the rotated image on the canvas
+    mask = cv2.warpAffine(np.ones_like(image, dtype=np.uint8), M, (new_w, new_h))
+    canvas[mask > 0] = rotated[mask > 0]
+
+    return canvas
 
 def goToLocation(pos_x, pos_y, height):
     """
@@ -132,9 +161,6 @@ def goToLocation(pos_x, pos_y, height):
         #GUI.showImage(frontal_img)
         GUI.showLeftImage(ventral_img)
 
-        # Print progress information
-        #print(f"Current position: x={drone_x:.2f}, y={drone_y:.2f}, z={drone_z:.2f}")
-
 def detectBlackRegions():
 
     black_threshold = 50  # Threshold to define black regions (intensity <= 50)
@@ -162,9 +188,6 @@ def detectBlackRegions():
     drone_coord = HAL.get_position()
 
     for contour in contours:
-
-        if len(contour) < 20: #Remove small regions
-            continue
         
         boundary_touched = False  # Flag for boundary-touching regions
 
@@ -194,45 +217,12 @@ def detectBlackRegions():
     # Show the updated image
     GUI.showImage(ventral_img)
 
+def detectFaces():
 
-def detectFaces(): #TODO simplify (avoid centering, use relative pixel coords)
-    """
-    Detects faces by rotating the ventral image in 30-degree increments.
-    If a face is found, it centers the drone on the face, lowers the altitude by 1 meter,
-    and verifies if the face is still detected. Returns the drone's current coordinates
-    if successful, otherwise returns an empty list.
-    """
-    
-    rotation_angles = [i * 30 for i in range(-6, 7)]  # [-180, -150, ..., 0, ..., 150, 180]
-    step_size = 0.5  # Movement step size for centering
-    height_reduction = 1  # Meters to descend when a face is detected
-    tolerance = 20  # Tolerance in pixels for centering
-    
-    def centerFace(x, y, w, h, ventral_img):
-        """
-        Adjusts the drone's position to center the detected face in the ventral image.
-        """
-        # Calculate the image center
-        img_center_x = ventral_img.shape[1] // 2
-        img_center_y = ventral_img.shape[0] // 2
-        
-        # Calculate offsets between face center and image center
-        face_center_x = x + w // 2
-        face_center_y = y + h // 2
-        offset_x = face_center_x - img_center_x
-        offset_y = face_center_y - img_center_y
+    total_faces = 0
+    shown_img = False
 
-        print(f"Face detected. Offsets: X={offset_x}, Y={offset_y}")
-        
-        # Adjust position based on offsets
-        drone_coord = HAL.get_position()
-        move_x = -step_size if offset_x > tolerance else (step_size if offset_x < -tolerance else 0)
-        move_y = -step_size if offset_y > tolerance else (step_size if offset_y < -tolerance else 0)
-
-        HAL.set_cmd_pos(drone_coord[0] + move_x, drone_coord[1] + move_y, drone_coord[2], 0)
-        print(f"Centering on face... Moving to: ({drone_coord[0] + move_x}, {drone_coord[1] + move_y}, {drone_coord[2]})")
-
-    for angle in rotation_angles:
+    for angle in range(-180, 180):
         # Get ventral image and rotate
         ventral_img = rotateImage(HAL.get_ventral_image(), angle)
         gray = cv2.cvtColor(ventral_img, cv2.COLOR_BGR2GRAY)
@@ -242,39 +232,16 @@ def detectFaces(): #TODO simplify (avoid centering, use relative pixel coords)
             gray, scaleFactor=1.1, minNeighbors=4, minSize=(20, 20)
         )
 
-        # If faces are found, center the drone and descend
-        if len(faces) > 0:
-            print(f"Face(s) detected at rotation angle {angle} degrees.")
+        if (angle%4==0 and len(faces)>0) or (angle%30==0):
             for x, y, w, h in faces:
-                # Visualize the detected face
                 cv2.rectangle(ventral_img, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                GUI.showImage(ventral_img)
+            GUI.showImage(ventral_img)
 
-                # Center on the face
-                centerFace(x, y, w, h, ventral_img)
+        total_faces += 1 if len(faces)>0 else 0
 
-                # Lower altitude by 1 meter
-                drone_coord = HAL.get_position()
-                HAL.set_cmd_pos(drone_coord[0], drone_coord[1], drone_coord[2] - height_reduction, 0)
-                print("Lowering altitude by 1 meter to confirm face presence...")
+    return total_faces #amount of angles with face
 
-                # Confirm face detection at new height
-                ventral_img = rotateImage(HAL.get_ventral_image(), angle)
-                gray = cv2.cvtColor(ventral_img, cv2.COLOR_BGR2GRAY)
-                faces_confirm = face_cascade.detectMultiScale(
-                    gray, scaleFactor=1.1, minNeighbors=4, minSize=(20, 20)
-                )
-
-                if len(faces_confirm) > 0:
-                    print("Face still detected after descent. Returning current coordinates.")
-                    final_coord = HAL.get_position()
-                    return [final_coord[0], final_coord[1], final_coord[2]]
-                else:
-                    print("Face no longer detected after descent.")
-
-    print("No faces detected in any rotation. Returning an empty list.")
-    return []
-
+##
 
 # Enter sequential code!
 
@@ -298,14 +265,6 @@ if HAL.get_landed_state() == 3:
 HAL.takeoff(3)
 print("Takeoff finished")
 
-
-# TODO go to initial location
-#go to 20m height
-#detect black regions, center on closest unseen (estimate position)
-#lower to 3m, detect faces (check all rotations)
-#if detected, add to list
-#go to 20m height, repeat
-
 # potential locations: exp average (if red more weight), with 1m radius tolerance, checked bool?
 # verified locations: detected face (calculate coords once)
 target_x=diff_x
@@ -315,25 +274,31 @@ target_y=diff_y
 goToLocation(target_x, target_y, 3)
 goToLocation(target_x, target_y, 20)
 
-for i in range(50):
-    detectBlackRegions()
-
 while True:
-    
+    for i in range(50):
+        detectBlackRegions()
+
     target_x,target_y = get_next_location()
     goToLocation(target_x, target_y, 3)
     
     
     if target_x==0 and target_y==0:
         HAL.land()
-        break #finished (returned to base)
+        print("PEOPLE COORDINATES: ",faces_detected)
+        break
+        #finished (returned to base)
     else:
-        for i in range(5): #TODO remove
-            detectBlackRegions()
-        #TODO detect faces
+        positives = 0
+        for i in range(5):
+            amount = detectFaces()
+            print("Detected:",amount)
+            if amount>10: #instead of >0 for noise
+                positives+=1
+        
+        if positives>=3:
+            print("Added face")
+            faces_detected.append((target_x,target_y))
+        else:
+            print("No face confirmed")
 
     goToLocation(target_x, target_y, 20)
-    for i in range(50):
-        detectBlackRegions()
-
-print("Faces detected: ",faces_detected)
